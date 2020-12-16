@@ -1,0 +1,870 @@
+---
+title: "LUSCvsLUAD"
+output: html_document
+---
+
+```{r}
+# All the functions and libraries needed for this script
+library(boot)
+library(limma)
+library(pheatmap)
+library(RColorBrewer)
+library(viridis)
+library(dplyr)
+library(gplots)
+library(heatmap3)
+library(caret)
+library(nnet)
+library(ROCR)
+library(ranger)
+library(data.table)
+library(xgboost)
+library(Matrix)
+library(glmnet)
+library(pROC)
+library(mRMRe)
+library(tibble)
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(edgeR)
+
+
+make_label <- function(HTSeq_matrix) {
+  label_HTSeq <- factor(c(0, 1))
+  x = 1
+  for (i in rownames(HTSeq_matrix)) {
+    if (substr(i, start = 1, stop = 4) == "LUAD") {
+      label_HTSeq[x] = 1
+    } else {
+      label_HTSeq[x] = 0
+    }
+    x = x + 1
+  }
+  return (label_HTSeq)
+}
+mean_squared_error <- function(data, index) {
+  responses <- data$response[index]
+  predictions <- data$prediction[index]
+  MSE <- mean((responses - predictions)^2)
+  return(MSE)
+}
+mean_absolute_error <- function(data, index) {
+  responses <- data$response[index]
+  predictions <- data$prediction[index]
+  MAE <- mean(abs(responses - predictions))
+  return(MAE)
+}
+OS_R_squared <- function(data, index) {
+  responses <- data$response[index]
+  predictions <- data$prediction[index]
+  baseline <- data$baseline[index]
+  SSE <- sum((responses - predictions)^2)
+  SST <- sum((responses - baseline)^2)
+  r2 <- 1 - SSE/SST
+  return(r2)
+}
+OSR2 <- function(prediction, test, train) {
+  SSE = sum((test - prediction)^2)
+  SST = sum((test - mean(train))^2)
+  OSR2 = 1 - SSE/SST
+  return (OSR2)
+}
+tableAccuracy <- function(test, pred) {
+  t = table(test, pred)
+  a = sum(diag(t)/length(test))
+  return(a)
+}
+
+accuracy <- function(data, index) {
+  responses <- data$response[index]
+  predictions <- data$prediction[index]
+  
+  acc <- tableAccuracy(responses, predictions)
+  return (acc)
+  
+}
+all_metrics <- function(data, index) {
+  mse <- mean_squared_error(data, index)
+  mae <- mean_absolute_error(data, index)
+  OSR2 <- OS_R_squared(data, index)
+  accurate <- accuracy(data, index)
+  return(c(mse, mae, OSR2, accurate))
+}
+```
+
+
+
+Acquisition of Data from TCGAbiolinks based on their tutorial
+```{r}
+library(TCGAbiolinks)
+CancerProject <- "TCGA-LUSC"
+DataDirectory <- paste0("../GDC/",gsub("-","_",CancerProject))
+FileNameData <- paste0(DataDirectory, "_","HTSeq_Counts",".rda")
+
+CancerProject2 <- "TCGA-LUAD"
+DataDirectory2 <- paste0("../GDC/",gsub("-","_",CancerProject2))
+FileNameData2 <- paste0(DataDirectory2, "_","HTSeq_Counts",".rda")
+
+query <- GDCquery(project = CancerProject,
+                  data.category = "Transcriptome Profiling",
+                  data.type = "Gene Expression Quantification", 
+                  workflow.type = "HTSeq - Counts")
+
+query2 <- GDCquery(project = CancerProject2,
+                  data.category = "Transcriptome Profiling",
+                  data.type = "Gene Expression Quantification", 
+                  workflow.type = "HTSeq - Counts")
+
+samplesDown <- getResults(query,cols=c("cases"))
+samplesDown2 <- getResults(query2,cols=c("cases"))
+
+dataSmTP_HTSeq <- TCGAquery_SampleTypes(barcode = samplesDown2,
+                                  typesample = "TP") # This is LUAD
+
+LUSCTP_HTSeq <- TCGAquery_SampleTypes(barcode = samplesDown,
+                                  typesample = "TP")
+
+
+
+queryDown <- GDCquery(project = CancerProject, 
+                      data.category = "Transcriptome Profiling",
+                      data.type = "Gene Expression Quantification", 
+                      workflow.type = "HTSeq - Counts", 
+                      barcode = c(LUSCTP_HTSeq))
+queryDown2 <- GDCquery(project = CancerProject2, 
+                      data.category = "Transcriptome Profiling",
+                      data.type = "Gene Expression Quantification", 
+                      workflow.type = "HTSeq - Counts", 
+                      barcode = c(dataSmTP_HTSeq))
+
+
+GDCdownload(query = queryDown,
+            directory = DataDirectory)
+GDCdownload(query = queryDown2,
+            directory = DataDirectory2)
+
+LUSCdataPrep <- GDCprepare(query = queryDown, 
+                       save = TRUE, 
+                       directory =  DataDirectory,
+                       save.filename = FileNameData)
+
+LUSCdataPrep <- TCGAanalyze_Preprocessing(object = LUSCdataPrep, 
+                                      cor.cut = 0.6,
+                                      datatype = "HTSeq - Counts") 
+
+dataPrep <- GDCprepare(query = queryDown2, 
+                       save = TRUE, 
+                       directory =  DataDirectory2,
+                       save.filename = FileNameData2)
+
+dataPrep <- TCGAanalyze_Preprocessing(object = dataPrep, 
+                                      cor.cut = 0.6,
+                                      datatype = "HTSeq - Counts") 
+
+LUSCdataNorm_HTSeq <- TCGAanalyze_Normalization(tabDF = LUSCdataPrep,
+                                      geneInfo = geneInfoHT,
+                                      method = "gcContent")
+
+dataNorm_HTSeq <- TCGAanalyze_Normalization(tabDF = dataPrep,
+                                      geneInfo = geneInfoHT,
+                                      method = "gcContent") 
+
+write.table(dataNorm_HTSeq, "LUAD_HTSeq_Count_gcContentNormalized.txt", sep="\t")
+write.table(LUSCdataNorm_HTSeq, "LUSC_HTSeq_Count_gcContentNormalized.txt", sep="\t")
+
+# quantile filter of genes
+dataFilt_HTSeq <- TCGAanalyze_Filtering(tabDF = dataNorm_HTSeq,
+                                  method = "quantile", 
+                                  qnt.cut =  0.25)
+LUSCdataFilt_HTSeq <- TCGAanalyze_Filtering(tabDF = LUSCdataNorm_HTSeq,
+                                  method = "quantile", 
+                                  qnt.cut =  0.25)
+
+# merging the two tables (LUSC and LUAD)
+# replacing columnn names for LUAD and LUSC tumor samples
+LUAD_TP_HTSeq_matrix <- dataFilt_HTSeq[,dataSmTP_HTSeq]
+LUSC_TP_HTSeq_matrix <- LUSCdataFilt_HTSeq[,LUSCTP_HTSeq]
+LUADTP_colname_HTSeq = vector()
+for (i in 1:length(dataSmTP_HTSeq)) {
+  LUADTP_colname_HTSeq[i] <- paste("LUADTP_", toString(i))
+}
+LUSCTP_colname_HTSeq = vector()
+for (i in 1:length(LUSCTP_HTSeq)) {
+  LUSCTP_colname_HTSeq[i] = paste("LUSCTP_", toString(i))
+}
+colnames(LUAD_TP_HTSeq_matrix) <- LUADTP_colname_HTSeq
+colnames(LUSC_TP_HTSeq_matrix) <-  LUSCTP_colname_HTSeq
+
+# full outer join of LUSC and LUAD tumor samples
+LUAD_TP_HTSeq_matrix <- cbind(Row.Names = rownames(LUAD_TP_HTSeq_matrix), LUAD_TP_HTSeq_matrix)
+LUSC_TP_HTSeq_matrix <- cbind(Row.Names = rownames(LUSC_TP_HTSeq_matrix), LUSC_TP_HTSeq_matrix)
+combined_TP_HTSeq <- merge(LUAD_TP_HTSeq_matrix, LUSC_TP_HTSeq_matrix, by = "Row.Names", all = TRUE) 
+combined_TP_HTSeq[is.na(combined_TP_HTSeq)] <- 0
+names(combined_TP_HTSeq)[1] <- ""
+
+
+#Chaning combined_TP back into a matrix
+matrix.please<-function(x) {
+    m<-as.matrix(x[,-1])
+    rownames(m)<-x[,1]
+    m
+}
+
+check_HTSeq <- matrix.please(combined_TP_HTSeq)
+mode(check_HTSeq) <- "numeric"
+combined_TP_HTSeq <- check_HTSeq
+
+```
+
+
+
+
+```{r}
+# Doing DGE using edgeR
+library(edgeR)
+sample_info_HTSeq.edger <- factor(c(rep("LUADTP", length(LUADTP_colname_HTSeq)), rep("LUSCTP", length(LUSCTP_colname_HTSeq))))
+sample_info_HTSeq.edger <- relevel(sample_info_HTSeq.edger, ref = "LUADTP")
+
+# Using edger
+edgeR.DGElist.TP.HTSeq <- DGEList(counts = combined_TP_HTSeq, group = sample_info_HTSeq.edger)
+# check result
+head(edgeR.DGElist.TP.HTSeq$counts)
+edgeR.DGElist.TP.HTSeq$samples
+```
+
+```{r}
+#get an impression of the coverage across samples
+hist(log2(rowSums(cpm(edgeR.DGElist.TP.HTSeq))))
+summary(log2(rowSums(cpm(edgeR.DGElist.TP.HTSeq))))
+# remove genes that do not have one count per million in at least 600 samples
+keep_HTSeq <- rowSums(cpm(edgeR.DGElist.TP.HTSeq) >= 1) >= 600
+edgeR.DGElist.TP.HTSeq <- edgeR.DGElist.TP.HTSeq[keep_HTSeq,]
+
+#recompute library sizes after filtering
+edgeR.DGElist.TP.HTSeq$samples$lib.size <- colSums(edgeR.DGElist.TP.HTSeq$counts)
+head(edgeR.DGElist.TP.HTSeq$samples)
+
+# calculate normalization factors for the library sizes using TMM
+edgeR.DGElist.TP.HTSeq.TMM <- calcNormFactors(edgeR.DGElist.TP.HTSeq, method = "TMM")
+edgeR.DGElist.TP.HTSeq.TMM$samples
+
+design_HTSeq <- model.matrix(~sample_info_HTSeq.edger)
+
+# estimate the dispersion for all read counts across all samples
+edgeR.DGElist.TP.HTSeq.TMM <- estimateDisp(edgeR.DGElist.TP.HTSeq.TMM, design_HTSeq)
+
+# fit the negative binomial model
+edger_fit_HTSeq <- glmFit(edgeR.DGElist.TP.HTSeq.TMM, design_HTSeq)
+
+#perform the testing for every gene using the negative binomial model
+edger_lrt_HTSeq <- glmLRT(edger_fit_HTSeq)
+
+# extract results from edger_lrt table plus adjusted p-values
+DGE.results_edgeR_HTSeq <- topTags(edger_lrt_HTSeq, n = Inf, # to retrieve all genes
+                            sort.by = "PValue", adjust.method = "BH" )
+
+# get transformed read counts
+combined_TP_counts <- edgeR.DGElist.TP.HTSeq.TMM$counts
+edgeR.DGElist.TP.HTSeq.TMM$samples
+combined_TP_tmm <- cpm(edgeR.DGElist.TP.HTSeq.TMM)
+```
+
+
+
+
+
+
+```{r}
+# Select top 500 Genes using DGE and validate with random forest using ranger
+setDT(DGE.results_edgeR_HTSeq$table, keep.rownames = TRUE)[]
+lst_genes_HTSeq <- head(DGE.results_edgeR_HTSeq$table$rn, 500)
+
+DGE_machine_learning_matrix_HTSeq <- combined_TP_tmm[lst_genes_HTSeq,]
+DGE_machine_learning_matrix_HTSeq <- as.data.frame(t(DGE_machine_learning_matrix_HTSeq))
+
+DGE_machine_learning_matrix_HTSeq <- combined_TP_tmm[lst_genes_HTSeq,]
+DGE_machine_learning_matrix_HTSeq <- as.data.frame(t(DGE_machine_learning_matrix_HTSeq))
+
+DGE_machine_learning_matrix_HTSeq$isLUAD <- make_label(DGE_machine_learning_matrix_HTSeq)
+
+# Start Splitting the data
+set.seed(12)
+train.DGE.HTSeq <- sample(nrow(DGE_machine_learning_matrix_HTSeq), 0.7*nrow(DGE_machine_learning_matrix_HTSeq))
+DGE_machine_learning_matrix.train.HTSeq <- DGE_machine_learning_matrix_HTSeq[train.DGE.HTSeq,]
+DGE_machine_learning_matrix.test.HTSeq <- DGE_machine_learning_matrix_HTSeq[-train.DGE.HTSeq,]
+table(DGE_machine_learning_matrix.test.HTSeq$isLUAD)
+
+# 5-fold Cross validation using train
+tgrid <- expand.grid(
+  .mtry = 1:30,
+  .splitrule = "gini", 
+  .min.node.size = 1
+)
+set.seed(12)
+DGE.rf.cv <- train(isLUAD ~ ., 
+                   data = DGE_machine_learning_matrix.train.HTSeq,
+                   method = "ranger",
+                   tuneGrid = tgrid,
+                   trControl = trainControl(method = "cv", number = 5, verboseIter = TRUE)
+                   )
+DGE.rf.cv #mtry = 18
+
+# Training the Data and Testing
+
+set.seed(12)
+DGE_rf.HTSeq <- ranger(isLUAD ~ ., mtry  = 18, data = DGE_machine_learning_matrix.train.HTSeq, importance = "impurity")
+DGE_pred_HTSeq <- predict(DGE_rf.HTSeq, data = DGE_machine_learning_matrix.test.HTSeq)
+DGE_machine_learning_matrix.test.HTSeq
+DGE_accuracy.HTSeq <- tableAccuracy(DGE_pred_HTSeq$predictions, DGE_machine_learning_matrix.test.HTSeq$isLUAD)
+DGE_accuracy.HTSeq
+table(DGE_pred_HTSeq$predictions, DGE_machine_learning_matrix.test.HTSeq$isLUAD)
+DGE_ranger_gini.HTSeq <- as.data.frame(DGE_rf.HTSeq$variable.importance)
+setDT(DGE_ranger_gini.HTSeq, keep.rownames = TRUE)[]
+colnames(DGE_ranger_gini.HTSeq) <- c("Gene", "Gini")
+DGE_ranger_gini_table <- DGE_ranger_gini.HTSeq %>% arrange(desc(Gini))
+DGE_ranger_gini_table
+#write.csv(DGE_ranger_gini_table, "DGE_rf_gini.csv", sep='\t')
+```
+
+
+
+```{r}
+# Applying PCA and selecting top 500 from first component of PCA, then validate with random forest
+sample_combined_TP_tmm <- combined_TP_tmm
+pc <- prcomp(sample_combined_TP_tmm)
+first_component_genes <- as.data.frame(pc$x[,1])
+colnames(first_component_genes) <- "value"
+sorted_pc1_genes <- first_component_genes %>% rownames_to_column('Gene') %>% arrange(desc(abs(value))) %>% column_to_rownames('Gene')
+pca_chosen_genes <- row.names(sorted_pc1_genes)[1:500]
+
+
+#Start making a matrix of only the PCA selected genes
+
+PCA_ML_matrix_HTSeq <- as.data.frame(t(combined_TP_tmm[pca_chosen_genes,]))
+
+PCA_ML_matrix_HTSeq$isLUAD <- make_label(PCA_ML_matrix_HTSeq)
+
+# Start Splitting the data (using the same gene order as DGE_machine_learning_matrix_HTSeq and with the same seed)
+set.seed(12)
+train.PCA.HTSeq <- train.DGE.HTSeq # to ensure that the data is split the same way as DGE
+PCA.rf.train.HTSeq <- PCA_ML_matrix_HTSeq[train.PCA.HTSeq,]
+PCA.rf.test.HTSeq <- PCA_ML_matrix_HTSeq[-train.PCA.HTSeq,]
+table(PCA.rf.test.HTSeq$isLUAD)
+
+# Cross validation using train
+tgrid <- expand.grid(
+  .mtry = 1:30,
+  .splitrule = "gini", 
+  .min.node.size = 1
+)
+set.seed(12)
+PCA.rf.cv <- train(isLUAD ~ ., 
+                   data = PCA.rf.train.HTSeq,
+                   method = "ranger",
+                   tuneGrid = tgrid,
+                   trControl = trainControl(method = "cv", number = 5, verboseIter = TRUE)
+                   )
+PCA.rf.cv #mtry = 22
+
+# Training the Data and Testing 
+set.seed(12)
+PCA_rf.HTSeq <- ranger(isLUAD ~ ., mtry = 22, data = PCA.rf.train.HTSeq, importance = "impurity")
+PCA_pred_HTSeq <- predict(PCA_rf.HTSeq, data = PCA.rf.test.HTSeq)
+PCA_accuracy.HTSeq <- tableAccuracy(PCA_pred_HTSeq$predictions, PCA.rf.test.HTSeq$isLUAD)
+PCA_accuracy.HTSeq
+table(PCA_pred_HTSeq$predictions, PCA.rf.test.HTSeq$isLUAD)
+PCA_ranger_gini.HTSeq <- as.data.frame(PCA_rf.HTSeq$variable.importance)
+setDT(PCA_ranger_gini.HTSeq, keep.rownames = TRUE)[]
+colnames(PCA_ranger_gini.HTSeq) <- c("Gene", "Gini")
+PCA_ranger_gini_table <- PCA_ranger_gini.HTSeq %>% arrange(desc(Gini))
+PCA_ranger_gini_table
+#write.csv(PCA_ranger_gini_table, "PCA_rf_gini.csv", sep='\t')
+
+```
+
+
+```{r}
+# Use mRMRe Feauture Selection to select top 500 mRMR genes and validate with random forest
+library(mRMRe)
+library(dplyr)
+set.thread.count(2)
+mrmr <- mRMR.data(data = as.data.frame(t(combined_TP_tmm)))
+mRMR_model <- mRMR.classic(data = mrmr, target_indices = c(1), feature_count = 500)
+mRMR_feature_index <- solutions(mRMR_model)
+mRMR_feature_index <- mRMR_feature_index$`1`[1:500]
+mRMR_features <- combined_TP_tmm[mRMR_feature_index,]
+
+
+#Start making a matrix of only the mRMR selected genes with label
+mRMR_ML_matrix_HTSeq <- as.data.frame(t(mRMR_features))
+mRMR_ML_matrix_HTSeq$isLUAD <- make_label(mRMR_ML_matrix_HTSeq)
+
+
+mRMR_ML_matrix_HTSeq$isLUAD <- label
+
+# Start Splitting the data (using the same gene order as DGE_machine_learning_matrix_HTSeq and with the same seed)
+set.seed(12)
+train.mRMR.HTSeq <- train.DGE.HTSeq # to ensure that the data is split the same way is DGE
+mRMR.rf.train.HTSeq <- mRMR_ML_matrix_HTSeq[train.mRMR.HTSeq,]
+mRMR.rf.test.HTSeq <- mRMR_ML_matrix_HTSeq[-train.mRMR.HTSeq,]
+table(mRMR.rf.test.HTSeq$isLUAD)
+
+# Cross validation using train for mRMR
+library(caret)
+tgrid <- expand.grid(
+  .mtry = 1:30,
+  .splitrule = "gini", 
+  .min.node.size = 1
+)
+set.seed(12)
+mRMR.rf.cv <- train(isLUAD ~ ., 
+                   data = mRMR.rf.train.HTSeq,
+                   method = "ranger",
+                   tuneGrid = tgrid,
+                   trControl = trainControl(method = "cv", number = 5, verboseIter = TRUE)
+                   )
+mRMR.rf.cv #mtry = 23
+# Training the Data and Testing 
+
+set.seed(12)
+mRMR_rf.HTSeq <- ranger(isLUAD ~ ., mtry = 23, data = mRMR.rf.train.HTSeq, importance = "impurity")
+mRMR_pred_HTSeq <- predict(mRMR_rf.HTSeq, data = mRMR.rf.test.HTSeq)
+mRMR_accuracy.HTSeq <- tableAccuracy(mRMR_pred_HTSeq$predictions, mRMR.rf.test.HTSeq$isLUAD)
+mRMR_accuracy.HTSeq
+table(mRMR_pred_HTSeq$predictions, mRMR.rf.test.HTSeq$isLUAD)
+mRMR_ranger_gini.HTSeq <- as.data.frame(mRMR_rf.HTSeq$variable.importance)
+setDT(mRMR_ranger_gini.HTSeq, keep.rownames = TRUE)[]
+colnames(mRMR_ranger_gini.HTSeq) <- c("Gene", "Gini")
+mRMR_ranger_gini_table <- mRMR_ranger_gini.HTSeq %>% arrange(desc(Gini))
+#write.csv(mRMR_ranger_gini_table, "mRMR_rf_gini.csv", sep='\t')
+```
+
+```{r}
+# Use lasso Feauture Selection and validate with random forest
+lasso <- as.data.frame(t(combined_TP_tmm))
+
+set.seed(123)
+split_lasso = sample(nrow(lasso), floor(0.7*nrow(lasso)))
+train_lasso = lasso[split_lasso,]
+test_lasso = lasso[-split_lasso,]
+#train_sparse = sparse.model.matrix(~., train_lasso) these take forever to run. Dont run unless necessary
+#test_sparse = sparse.model.matrix(~., test_lasso)
+
+label <- make_label(train_lasso)
+label_test <- make_label(test_lasso)
+label <- factor(c(0, 1))
+
+# Train the model
+lasso.fit = glmnet(x=train_sparse, y=label, alpha=1, family="binomial")
+
+# lasso cross validation
+cv.lasso = cv.glmnet(x=train_sparse, y=label, alpha=1, family="binomial")
+plot(cv.lasso)
+
+lambda = cv.lasso$lambda.1se # the value of lambda used by default
+lambda
+
+coefficients = as.matrix(coef(cv.lasso)) # convert to a matrix (618 by 1)
+
+test_lasso$cv.lasso <- predict(cv.lasso,newx=test_sparse,type='response')[,1]
+
+best.lambda <- cv.lasso$lambda.min
+best.lambda
+
+# Predict the test set using the model
+pred_lasso = predict(lasso.fit, test_sparse, type="response", s=best.lambda)
+
+# Apply a threshold to see
+new_pred_lasso = ifelse(pred_lasso >= 0.5, 1, 0)
+new_pred_lasso = data.frame(new_pred_lasso)
+lasso_table = cbind(label_test, new_pred_lasso)
+names(lasso_table) = c("actual", "predicted")
+lasso_matrix = table(lasso_table$actual, lasso_table$predicted)
+lasso_matrix
+
+
+#Start making a matrix of only the lasso selected genes and now validate with Random Forest
+lasso_ML_matrix_HTSeq <- as.data.frame(t(combined_TP_tmm[names(which(abs(coefficientss[,1]) > 0))[2:69],]))
+
+lasso_ML_matrix_HTSeq$isLUAD <- make_label(lasso_ML_matrix_HTSeq)
+
+# Start Splitting the data (using the same gene order as DGE_machine_learning_matrix_HTSeq and with the same seed)
+set.seed(12)
+train.lasso.HTSeq <- train.DGE.HTSeq # to ensure that the data is split the same way as DGE
+lasso.rf.train.HTSeq <- lasso_ML_matrix_HTSeq[train.lasso.HTSeq,]
+lasso.rf.test.HTSeq <- lasso_ML_matrix_HTSeq[-train.lasso.HTSeq,]
+table(lasso.rf.test.HTSeq$isLUAD)
+
+# Cross validation using train for mRMR
+library(caret)
+tgrid <- expand.grid(
+  .mtry = 1:30,
+  .splitrule = "gini", 
+  .min.node.size = 1
+)
+set.seed(12)
+lasso.rf.cv <- train(isLUAD ~ ., 
+                   data = lasso.rf.train.HTSeq,
+                   method = "ranger",
+                   tuneGrid = tgrid,
+                   trControl = trainControl(method = "cv", number = 5, verboseIter = TRUE)
+                   )
+lasso.rf.cv #mtry = 2
+
+# Training the Data and Testing 
+
+set.seed(12)
+lasso_rf.HTSeq <- ranger(isLUAD ~ ., mtry = 2, data = lasso.rf.train.HTSeq, importance = "impurity")
+lasso_pred_HTSeq <- predict(lasso_rf.HTSeq, data = lasso.rf.test.HTSeq)
+lasso_accuracy.HTSeq <- tableAccuracy(lasso_pred_HTSeq$predictions, lasso.rf.test.HTSeq$isLUAD)
+lasso_accuracy.HTSeq
+table(lasso_pred_HTSeq$predictions, lasso.rf.test.HTSeq$isLUAD)
+lasso_ranger_gini.HTSeq <- as.data.frame(lasso_rf.HTSeq$variable.importance)
+setDT(lasso_ranger_gini.HTSeq, keep.rownames = TRUE)[]
+colnames(lasso_ranger_gini.HTSeq) <- c("Gene", "Gini")
+lasso_ranger_gini_table <- lasso_ranger_gini.HTSeq %>% arrange(desc(Gini))
+lasso_ranger_gini_table
+#write.csv(lasso_ranger_gini_table, "lasso_rf_gini.csv", sep='\t')
+
+
+```
+
+```{r}
+
+# Do feature selection using XGboost and validate on random forest
+xgboost_rf_matrix <- as.data.frame(t(combined_TP_tmm))
+xgboost_rf_matrix$isLUAD <- make_label(xgboost_rf_matrix)
+
+#Start splitting data
+set.seed(12)
+train.xgb.rf <- sample(nrow(xgboost_rf_matrix), floor(0.7*nrow(xgboost_rf_matrix)))
+xgb.rf.train <- xgboost_rf_matrix[train.xgb.rf,]
+xgb.rf.test <- xgboost_rf_matrix[-train.xgb.rf,]
+table(xgb.rf.test$isLUAD)
+xgb.rf.train.dmatrix <- xgb.rf.train
+xgb.rf.train.dmatrix$isLUAD <- NULL
+xgb.rf.test.dmatrix <- xgb.rf.test
+xgb.rf.test.dmatrix$isLUAD <- NULL
+xgb.rf.dtrain <- xgb.DMatrix(data = data.matrix(xgb.rf.train.dmatrix), label = data.matrix(xgb.rf.train$isLUAD))
+xgb.rf.dtest <- xgb.DMatrix(data = data.matrix(xgb.rf.test.dmatrix), label = data.matrix(xgb.rf.test$isLUAD))
+
+# Cross validation for xgb for PCA selected genes
+params <- list(booster = "gbtree", objective = "binary:logistic", eta=0.3, gamma = 0, max_depth = 6, min_child_weight = 1, subsample = 1, solsample_bytree = 1)
+xgbcv.rf <- xgb.cv(params = params, data = xgb.rf.dtrain, nrounds = 100, nfold = 5, showsd = T, stratified = T, print.ever.n = 10, early_stop_rounds = 20, maximize = F) #best iteration 35 
+
+#xgb_val_rf <- xgb.train(data = PCA.val.xgb.dtrain, label = data.matrix(PCA.val.xgb.train.HTSeq$isLUAD), nrounds = 1, params = params)
+xgb_rf <- xgb.train(data = xgb.rf.dtrain, params = params, nrounds = 35, eval_metric = "error")
+xgb_rf_pred <- predict(xgb_rf, xgb.rf.dtest)
+xgb_rf_pred <- ifelse(xgb_rf_pred > 0.5,1,0)
+tableAccuracy(xgb.rf.test$isLUAD, xgb_rf_pred )
+table(xgb.rf.test$isLUAD, xgb_rf_pred)
+
+xgb_rf_mat <- xgb.importance(feature_names = colnames(xgb.rf.dtrain), model = xgb_rf)
+xgb.plot.importance(importance_matrix = xgb_rf_mat)
+xgb_rf_mat$Feature
+
+# Now do run it on Random forest using xgb selected features
+#Start making a matrix of only the xgb selected genes with label
+xgb_ML_matrix_HTSeq <- as.data.frame(t(combined_TP_tmm[xgb_rf_mat$Feature,]))
+xgb_ML_matrix_HTSeq$isLUAD <- make_label(xgb_ML_matrix_HTSeq)
+# Start Splitting the data (using the same gene order as DGE_machine_learning_matrix_HTSeq and with the same seed)
+set.seed(12)
+train.xgb.HTSeq <- train.DGE.HTSeq # to ensure that the data is split the same way as DGE
+xgb.rf.train.HTSeq <-xgb_ML_matrix_HTSeq[train.xgb.HTSeq,]
+xgb.rf.test.HTSeq <- xgb_ML_matrix_HTSeq[-train.xgb.HTSeq,]
+table(xgb.rf.test.HTSeq$isLUAD)
+
+# Cross validation using train for mRMR
+tgrid <- expand.grid(
+  .mtry = 1:30,
+  .splitrule = "gini", 
+  .min.node.size = 1
+)
+set.seed(12)
+xgb.rf.cv <- train(isLUAD ~ ., 
+                   data = xgb.rf.train.HTSeq,
+                   method = "ranger",
+                   tuneGrid = tgrid,
+                   trControl = trainControl(method = "cv", number = 5, verboseIter = TRUE)
+                   )
+xgb.rf.cv #mtry = 1
+
+# Training the Data and Testing 
+
+
+set.seed(12)
+xgb_rf.HTSeq <- ranger(isLUAD ~ ., mtry = 1, data = xgb.rf.train.HTSeq, importance = "impurity")
+xgb_pred_HTSeq <- predict(xgb_rf.HTSeq, data = xgb.rf.test.HTSeq)
+xgb_accuracy.HTSeq <- tableAccuracy(xgb_pred_HTSeq$predictions, xgb.rf.test.HTSeq$isLUAD)
+xgb_accuracy.HTSeq
+table(xgb_pred_HTSeq$predictions, xgb.rf.test.HTSeq$isLUAD)
+xgb_ranger_gini.HTSeq <- as.data.frame(xgb_rf.HTSeq$variable.importance)
+setDT(xgb_ranger_gini.HTSeq, keep.rownames = TRUE)[]
+colnames(xgb_ranger_gini.HTSeq) <- c("Gene", "Gini")
+xgb_ranger_gini_table <- xgb_ranger_gini.HTSeq %>% arrange(desc(Gini))
+xgb_ranger_gini_table
+```
+
+
+```{r}
+
+# Validation using random forest on overlapping genes
+top_genes <- read.csv("overlapping_genes.csv")
+validation_matrix <- as.data.frame(t(combined_TP_tmm[top_genes, ]))
+
+validation_matrix$isLUAD <- make_label(validation_matrix)
+
+# Start Splitting the data (using the same gene order as DGE_machine_learning_matrix_HTSeq and with the same seed)
+set.seed(12)
+train.rf.val.HTSeq <- train.DGE.HTSeq
+val.rf.train.HTSeq <- validation_matrix[train.rf.val.HTSeq,]
+val.rf.test.HTSeq <- validation_matrix[-train.rf.val.HTSeq,]
+table(val.rf.test.HTSeq$isLUAD)
+
+# Cross validation using train for mRMR
+library(caret)
+tgrid <- expand.grid(
+  .mtry = 1:30,
+  .splitrule = "gini", 
+  .min.node.size = 1
+)
+set.seed(12)
+val.rf.cv <- train(isLUAD ~ ., 
+                   data = val.rf.train.HTSeq,
+                   method = "ranger",
+                   tuneGrid = tgrid,
+                   trControl = trainControl(method = "cv", number = 5, verboseIter = TRUE)
+                   )
+val.rf.cv #mtry = 1
+
+# Training the Data and Testing 
+set.seed(12)
+val_rf.HTSeq <- ranger(isLUAD ~ ., mtry = 1, data = val.rf.train.HTSeq, importance = "impurity")
+val_pred_HTSeq <- predict(val_rf.HTSeq, data = val.rf.test.HTSeq)
+val_accuracy.HTSeq <- tableAccuracy(val_pred_HTSeq$predictions, val.rf.test.HTSeq$isLUAD)
+val_accuracy.HTSeq
+table(val_pred_HTSeq$predictions, val.rf.test.HTSeq$isLUAD)
+
+ranger_val_gini.HTSeq <- as.data.frame(val_rf.HTSeq$variable.importance)
+setDT(ranger_val_gini.HTSeq, keep.rownames = TRUE)[]
+colnames(ranger_val_gini.HTSeq) <- c("Gene", "Gini")
+ranger_val_gini_table <- ranger_val_gini.HTSeq %>% arrange(desc(Gini))
+ranger_val_gini_table
+```
+
+
+```{r}
+# Bootstrapping for PCA_rf
+PCA_rf_test_set <- data.frame(response = PCA.rf.test.HTSeq$isLUAD, prediction = PCA_pred_HTSeq$predictions, baseline = 0)
+set.seed(12)
+#PCA_rf_boot <- boot(PCA_rf_test_set, all_metrics, R = 10000) #this took a long time; don't run again unless necessary
+PCA_rf_boot_plot_results <- data.frame(accuracyestimates = PCA_rf_boot$t[,4], delta = PCA_rf_boot$t[,4] - PCA_rf_boot$t0[4])
+PCA_rf_boot_plot_results
+boot.ci(PCA_rf_boot, index = 4, type = "perc")
+
+
+#Bootstrapping for DGE_rf
+DGE_rf_test_set <- data.frame(response = DGE_machine_learning_matrix.test.HTSeq$isLUAD, prediction = DGE_pred_HTSeq$predictions, baseline = 0)
+# DGE_rf_boot <- boot(DGE_rf_test_set, all_metrics, R= 10000) # this took a long time: don't run again unless nescessary
+DGE_rf_boot_plot_results <- data.frame(accuracyestimates = DGE_rf_boot$t[,4], delta = DGE_rf_boot$t[,4] - DGE_rf_boot$t0[4])
+DGE_rf_boot_plot_results
+boot.ci(DGE_rf_boot, index = 4, type = "perc")
+
+
+#Bootstrapping for mRMR
+mRMR_rf_test_set <- data.frame(response = mRMR.rf.test.HTSeq$isLUAD, prediction = mRMR_pred_HTSeq$predictions, baseline = 0)
+#mRMR_rf_boot <- boot(mRMR_rf_test_set, all_metrics, R= 10000) # this took a long time: don't run again unless nescessary
+mRMR_rf_boot_plot_results <- data.frame(accuracyestimates = mRMR_rf_boot$t[,4], delta = mRMR_rf_boot$t[,4] - mRMR_rf_boot$t0[4])
+mRMR_rf_boot_plot_results
+boot.ci(mRMR_rf_boot, index = 4, type = "perc")
+
+#Bootstrapping for xgb
+xgb_rf_test_set <- data.frame(response = xgb.rf.test.HTSeq$isLUAD, prediction = xgb_pred_HTSeq$predictions, baseline = 0)
+#xgb_rf_boot <- boot(xgb_rf_test_set, all_metrics, R= 10000) # this took a long time: don't run again unless nescessary
+xgb_rf_boot_plot_results <- data.frame(accuracyestimates = xgb_rf_boot$t[,4], delta = xgb_rf_boot$t[,4] - xgb_rf_boot$t0[4])
+xgb_rf_boot_plot_results
+boot.ci(xgb_rf_boot, index = 4, type = "perc")
+
+#Bootstrapping for lasso
+lasso_rf_test_set <- data.frame(response = lasso.rf.test.HTSeq$isLUAD, prediction = lasso_pred_HTSeq$predictions, baseline = 0)
+#lasso_rf_boot <- boot(lasso_rf_test_set, all_metrics, R= 10000) # this took a long time: don't run again unless nescessary
+lasso_rf_boot_plot_results <- data.frame(accuracyestimates = lasso_rf_boot$t[,4], delta = lasso_rf_boot$t[,4] - lasso_rf_boot$t0[4])
+lasso_rf_boot_plot_results
+boot.ci(lasso_rf_boot, index = 4, type = "perc")
+
+#Bootstrapping for the overlapping genes
+overlap_rf_test_set <- data.frame(response = PCA.val.rf.test.HTSeq$isLUAD, prediction = PCA_val_pred_HTSeq$predictions, baseline = 0)
+#overlap_rf_boot <- boot(overlap_rf_test_set, all_metrics, R= 10000) # this took a long time: don't run again unless nescessary
+overlap_rf_boot_plot_results <- data.frame(accuracyestimates = overlap_rf_boot$t[,4], delta = overlap_rf_boot$t[,4] - overlap_rf_boot$t0[4])
+overlap_rf_boot_plot_results
+boot.ci(overlap_rf_boot, index = 4, type = "perc")
+
+```
+
+
+```{r}
+ROC_matrix <- as.data.frame(t(combined_TP_tmm))
+label <- factor(c(0, 1))
+x = 1
+for (i in rownames(ROC_matrix)) {
+  if (substr(i, start = 1, stop = 4) == "LUAD") {
+    label[x] = 1
+  } else {
+    label[x] = 0
+  }
+  x = x + 1
+}
+
+ROC_matrix$isLUAD <- label
+
+KRT17_model <- multinom(isLUAD ~ ENSG00000128422, family = "binomial", data = ROC_matrix)
+#p <- predict(KRT17_model, ROC_matrix)
+#tab <- table(p, ROC_matrix$isLUAD )
+#1 - sum(diag(tab))/sum(tab)
+pred_KRT17 <- predict(KRT17_model, ROC_matrix, type = 'prob')
+pred_KRT17 <- ROCR::prediction(pred_KRT17, ROC_matrix$isLUAD)
+roc_KRT17 <- ROCR::performance(pred_KRT17, "tpr", "fpr")
+
+
+GPC1_model <- multinom(isLUAD ~ ENSG00000063660, family = "binomial", data = ROC_matrix)
+pred_GPC1 <- predict(GPC1_model, ROC_matrix, type = 'prob')
+pred_GPC1 <- ROCR::prediction(pred_GPC1, ROC_matrix$isLUAD)
+roc_GPC1 <- ROCR::performance(pred_GPC1, "tpr", "fpr")
+
+NECTIN1_model <- multinom(isLUAD ~ ENSG00000110400, family = "binomial", data = ROC_matrix)
+pred_NECTIN1 <- predict(NECTIN1_model, ROC_matrix, type = 'prob')
+pred_NECTIN1 <- ROCR::prediction(pred_NECTIN1, ROC_matrix$isLUAD)
+roc_NECTIN1 <- ROCR::performance(pred_NECTIN1, "tpr", "fpr")
+
+PERP_model <- multinom(isLUAD ~ ENSG00000112378, family = "binomial", data = ROC_matrix)
+pred_PERP <- predict(PERP_model, ROC_matrix, type = 'prob')
+pred_PERP <- ROCR::prediction(pred_PERP, ROC_matrix$isLUAD)
+roc_PERP <- ROCR::performance(pred_PERP, "tpr", "fpr")
+
+REPS1_model <- multinom(isLUAD ~ ENSG00000135597, family = "binomial", data = ROC_matrix)
+pred_REPS1 <- predict(REPS1_model, ROC_matrix, type = 'prob')
+pred_REPS1 <- ROCR::prediction(pred_REPS1, ROC_matrix$isLUAD)
+roc_REPS1 <- ROCR::performance(pred_REPS1, "tpr", "fpr")
+
+
+TRIM29_model <- multinom(isLUAD ~ ENSG00000137699, family = "binomial", data = ROC_matrix)
+pred_TRIM29 <- predict(TRIM29_model, ROC_matrix, type = 'prob')
+pred_TRIM29 <- ROCR::prediction(pred_TRIM29, ROC_matrix$isLUAD)
+roc_TRIM29 <- ROCR::performance(pred_TRIM29, "tpr", "fpr")
+
+
+
+
+pdf("AUC.pdf", width=6, height=5)
+
+plot(roc_KRT17, col=2, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+plot(roc_GPC1, col=3, add=TRUE, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+plot(roc_NECTIN1, col=4, add=TRUE, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+plot(roc_PERP, col=5, add=TRUE, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+plot(roc_REPS1, col=6, add=TRUE, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+plot(roc_TRIM29, col=7, add=TRUE, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+abline(a=0, b=1)
+legend(0.5, 0.5, legend = c("KRT17 AUC:0.9269", "GPC1 AUC:0.9376", "NECTIN1 AUC:0.9514", "PERP AUC:0.9529", "REPS1 AUC:0.8919", "TRIM29 AUC:0.9467"), col=c(2,3,4,5,6,7), lwd=1:2)
+
+dev.off()
+
+
+# ROC curves continued
+
+CELSR2_model <- multinom(isLUAD ~ ENSG00000143126, family = "binomial", data = ROC_matrix)
+#p <- predict(KRT17_model, ROC_matrix)
+#tab <- table(p, ROC_matrix$isLUAD )
+#1 - sum(diag(tab))/sum(tab)
+pred_CELSR2 <- predict(CELSR2_model, ROC_matrix, type = 'prob')
+pred_CELSR2 <- ROCR::prediction(pred_CELSR2, ROC_matrix$isLUAD)
+roc_CELSR2 <- ROCR::performance(pred_CELSR2, "tpr", "fpr")
+
+
+TUBA1C_model <- multinom(isLUAD ~ ENSG00000167553, family = "binomial", data = ROC_matrix)
+pred_TUBA1C <- predict(TUBA1C_model, ROC_matrix, type = 'prob')
+pred_TUBA1C <- ROCR::prediction(pred_TUBA1C, ROC_matrix$isLUAD)
+roc_TUBA1C <- ROCR::performance(pred_TUBA1C, "tpr", "fpr")
+
+KRT5_model <- multinom(isLUAD ~ ENSG00000186081, family = "binomial", data = ROC_matrix)
+pred_KRT5 <- predict(KRT5_model, ROC_matrix, type = 'prob')
+pred_KRT5 <- ROCR::prediction(pred_KRT5, ROC_matrix$isLUAD)
+roc_KRT5 <- ROCR::performance(pred_KRT5, "tpr", "fpr")
+
+KRT14_model <- multinom(isLUAD ~ ENSG00000186847, family = "binomial", data = ROC_matrix)
+pred_KRT14 <- predict(KRT14_model, ROC_matrix, type = 'prob')
+pred_KRT14 <- ROCR::prediction(pred_KRT14, ROC_matrix$isLUAD)
+roc_KRT14 <- ROCR::performance(pred_KRT14, "tpr", "fpr")
+
+KRT6A_model <- multinom(isLUAD ~ ENSG00000205420, family = "binomial", data = ROC_matrix)
+pred_KRT6A <- predict(KRT6A_model, ROC_matrix, type = 'prob')
+pred_KRT6A <- ROCR::prediction(pred_KRT6A, ROC_matrix$isLUAD)
+roc_KRT6A <- ROCR::performance(pred_KRT6A, "tpr", "fpr")
+
+S100A2_model <- multinom(isLUAD ~ ENSG00000196754, family = "binomial", data = ROC_matrix)
+pred_S100A2 <- predict(S100A2_model, ROC_matrix, type = 'prob')
+pred_S100A2 <- ROCR::prediction(pred_S100A2, ROC_matrix$isLUAD)
+roc_S100A2 <- ROCR::performance(pred_S100A2, "tpr", "fpr")
+
+
+
+
+pdf("AUC2.pdf", width=6, height=5)
+
+plot(roc_CELSR2, col=2, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+plot(roc_TUBA1C, col=3, add=TRUE, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+plot(roc_KRT5, col=4, add=TRUE, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+plot(roc_KRT14, col=5, add=TRUE, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+plot(roc_KRT6A, col=6, add=TRUE, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+plot(roc_S100A2, col=7, add=TRUE, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+abline(a=0, b=1)
+legend(0.5, 0.5, legend = c("CELSR2 AUC:0.9077", "TUBA1C AUC:0.8871", "KRT5 AUC:0.9731", "KRT14 AUC:0.9401", "KRT6A AUC:0.9532", "S100A2 AUC:0.894"), col=c(2,3,4,5,6,7), lwd=1:2)
+
+dev.off()
+
+
+# ROC curve for downregulated genes
+
+QSOX1_model <- multinom(isLUAD ~ ENSG00000116260, family = "binomial", data = ROC_matrix)
+pred_QSOX1 <- predict(QSOX1_model, ROC_matrix, type = 'prob')
+pred_QSOX1 <- ROCR::prediction(pred_QSOX1, ROC_matrix$isLUAD)
+roc_QSOX1 <- ROCR::performance(pred_QSOX1, "tpr", "fpr")
+
+ARHGAP12_model <- multinom(isLUAD ~ ENSG00000165322, family = "binomial", data = ROC_matrix)
+pred_ARHGAP12 <- predict(ARHGAP12_model, ROC_matrix, type = 'prob')
+pred_ARHGAP12 <- ROCR::prediction(pred_ARHGAP12, ROC_matrix$isLUAD)
+roc_ARHGAP12 <- ROCR::performance(pred_ARHGAP12, "tpr", "fpr")
+
+ELFN2_model <- multinom(isLUAD ~ ENSG00000166897, family = "binomial", data = ROC_matrix)
+pred_ELFN2 <- predict(ELFN2_model, ROC_matrix, type = 'prob')
+pred_ELFN2 <- ROCR::prediction(pred_ELFN2, ROC_matrix$isLUAD)
+roc_ELFN2 <- ROCR::performance(pred_ELFN2, "tpr", "fpr")
+
+MUC1_model <- multinom(isLUAD ~ ENSG00000185499, family = "binomial", data = ROC_matrix)
+pred_MUC1 <- predict(MUC1_model, ROC_matrix, type = 'prob')
+pred_MUC1 <- ROCR::prediction(pred_MUC1, ROC_matrix$isLUAD)
+roc_MUC1 <- ROCR::performance(pred_MUC1, "tpr", "fpr")
+
+ARHGEF38_model <- multinom(isLUAD ~ ENSG00000236699, family = "binomial", data = ROC_matrix)
+pred_ARHGEF38 <- predict(ARHGEF38_model, ROC_matrix, type = 'prob')
+pred_ARHGEF38 <- ROCR::prediction(pred_ARHGEF38, ROC_matrix$isLUAD)
+roc_ARHGEF38 <- ROCR::performance(pred_ARHGEF38, "tpr", "fpr")
+
+
+
+
+pdf("AUC3.pdf", width=7, height=5)
+
+plot(roc_QSOX1, col=2, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+plot(roc_ARHGAP12, col=3, add=TRUE, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+plot(roc_ELFN2, col=4, add=TRUE, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+plot(roc_MUC1, col=5, add=TRUE, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+plot(roc_ARHGEF38, col=6, add=TRUE, main = "ROC Curve", ylab = "Sensitivity", xlab = "1-Specificity")
+legend(0.5, 0.5, legend = c("QSOX1 AUC:0.8746", "ARHGAP12 AUC:0.911", "ELFN2 AUC:0.8441", "MUC1 AUC:0.9238", "ARHGEF38 AUC:0.9574"), col=c(2,3,4,5,6), lwd=1:2)
+abline(a=0, b=1)
+
+dev.off()
+
+
+```
+
+
